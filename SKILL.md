@@ -13,13 +13,13 @@ Diagnose the **desktop visibility** and manage the lifecycle of ZCode threads: a
 |------|-----|-----|
 | Read a thread's context | Built-in `#sess_xxx` → `ReadSessionContext` tool | The `#sess_` reference is parsed from user input (`/#(sess_[A-Za-z0-9_-]+)/g`) and injected as a system-reminder. `ReadSessionContext` calls `sessionStore.getSession()` + `sessionStore.messages()` - no archive filtering, works on any session ID. This is the primary read path. |
 | Create a headless thread | `zcode --prompt "..."` | The built-in CLI creates a session in the session store. It does **not** appear in the desktop task list. |
-| Create a GUI-visible thread (optionally with model / reasoning difficulty) | This skill: `prepare-gui-new` → `execute-gui-new` | Sends a V4 `createSession` command through `zcodeAgentService.sendConversationCommandV4`, reusing the renderer's registered `clientId`. The session and its first turn are created atomically and the task is immediately visible and usable. |
+| Create a GUI-visible thread (optionally with model / reasoning difficulty) | This skill: `gui-new` | Sends a V4 `createSession` command through `zcodeAgentService.sendConversationCommandV4`, reusing the renderer's registered `clientId`. The session and its first turn are created atomically and the task is immediately visible and usable. Use the prepare/execute form only when a one-off preview is requested. |
 | Send a follow-up to a thread | `zcode --resume <sess> --prompt "..."` | Built-in headless resume. |
-| Send a GUI-visible follow-up | This skill: `prepare-gui-send` → `execute-gui-send` | Appends through the desktop renderer. |
+| Send a GUI-visible follow-up | This skill: `gui-send` | Appends through the desktop renderer. Use the prepare/execute form only when a one-off preview is requested. |
 | **Archive a thread** | **This skill only**: `prepare-gui-archive` → `execute-gui-archive` | The built-in `session/*` protocol has no archive method. Only `zcodeTaskService.archiveTask` (desktop renderer) can archive. |
 | **Unarchive a thread** | **This skill only**: `prepare-gui-unarchive` → `execute-gui-unarchive` | Only `zcodeTaskService.unarchiveTask`. |
 | **Delete a thread** | **This skill only**: `prepare-gui-delete` -> `execute-gui-delete` | Only `zcodeTaskService.deleteTask`. Irreversible. |
-| **Set a thread's model / reasoning difficulty** | **This skill only**: `prepare-gui-config` -> `execute-gui-config` | `zcodeTaskService.setModel` and `setConfigOption`. Applies to an existing, working GUI thread. |
+| **Set a thread's model / reasoning difficulty** | **This skill only**: `gui-config` | `zcodeTaskService.setModel` and `setConfigOption`. Applies to an existing, working GUI thread. Use the prepare/execute form only when a one-off preview is requested. |
 | **Find a GUI-missing thread** | **This skill only**: `diagnose` | Compares the local session store with the desktop task index and reports whether the thread is active, archived, deleted, session-only, or index-only. |
 | **List archived or deleted threads** | **This skill only**: `list-archived` / `list-deleted` | Reads desktop task-index rows by their actual GUI lifecycle state. |
 | List live GUI threads | This skill: `list` | Reads the task index's `archived=0, deleted=0` rows, which is the desktop visibility source of truth. |
@@ -40,11 +40,13 @@ Trigger this skill when the user:
 
 ## Safety rules
 
-- Require `--workspace <absolute-path>` for every command.
+- Require `--workspace <absolute-path>` for every command. The path must already exist as a directory; the skill never creates, switches, removes, or cleans Git worktrees.
 - `list`, `list-archived`, `list-deleted`, `diagnose`, and `read` are read-only. They open the session store or task index with read-only SQLite connections and never modify `~/.zcode/cli/db/db.sqlite`, its WAL files, `~/.zcode/v2/tasks-index.sqlite`, or ZCode configuration.
 - Never write to `~/.zcode/cli/db/db.sqlite`, `~/.zcode/v2/tasks-index.sqlite`, or ZCode configuration directly. Mutation happens only through the installed, version-locked GUI bridge.
-- The GUI bridge uses only the loopback-only ZCode CDP endpoint on port `9333`, validates the desktop process and a unique workspace renderer, and calls the renderer's desktop-owned `zcodeTaskService`. Do not substitute another CDP endpoint, a direct GUI automation path, or a SQLite write.
-- Do not run any `execute-*` command until the user has explicitly confirmed the exact workspace, target session, prompt (when applicable), CDP port, and the one-time confirmation token shown by the matching `prepare-*` command. Tokens expire after 15 minutes and are consumed before execution starts.
+- The GUI bridge uses only the loopback-only ZCode CDP endpoint on port `9333`, validates the desktop process and a unique workspace renderer, and calls the renderer's desktop-owned `zcodeTaskService` / `zcodeSessionService`. Do not substitute another CDP endpoint, a direct GUI automation path, or a SQLite write.
+- GUI commands require the exact `--workspace` directory to be open in exactly one ZCode desktop renderer. An existing Git worktree is supported only when that exact path is already open in ZCode; the skill does not open or create directories for you.
+- `gui-new`, `gui-send`, and `gui-config` are reversible/local GUI operations. Run them directly when the current user request or a durable automation scope authorizes the action; do not add a per-call token confirmation that the user did not request. Their `prepare-*` / `execute-*` forms remain available for a one-off preview when explicitly useful.
+- Archive, unarchive, and delete change thread lifecycle. Do not run their `execute-*` commands until the user has explicitly confirmed the exact workspace, target session, CDP port, and one-time token shown by the matching `prepare-*` command. These tokens expire after 15 minutes and are consumed before execution starts.
 - Archive and unarchive require a root `interactive` session that is already a visible GUI task (present in the desktop task index with `archived=0, deleted=0`). Headless sessions are rejected at the prepare stage.
 - If the runtime compatibility check fails, stop and provide a handoff prompt. Do not emulate a write through SQLite.
 
@@ -60,15 +62,15 @@ node "$Z" list-archived   --workspace "/absolute/workspace/path" --limit 20
 node "$Z" list-deleted    --workspace "/absolute/workspace/path" --limit 20
 node "$Z" diagnose        --workspace "/absolute/workspace/path" --session sess_xxx
 node "$Z" read            --workspace "/absolute/workspace/path" --session sess_xxx --turns 8 --max-chars 1200
+node "$Z" list-models     --workspace "/absolute/workspace/path" [--json]
 
-# ── CREATE (GUI-visible) ──
-node "$Z" prepare-gui-new --workspace "/absolute/workspace/path" --prompt "..."
-node "$Z" prepare-gui-new --workspace "/absolute/workspace/path" --prompt "..." --provider "provider-id" --model "model-id" --thought-level "high"
-node "$Z" execute-gui-new --workspace "/absolute/workspace/path" --prompt "..." --provider "provider-id" --model "model-id" --thought-level "high" --confirmation ztc_xxx
+# ── CREATE / SEND / CONFIGURE (GUI-visible, directly authorized) ──
+node "$Z" gui-new    --workspace "/absolute/workspace/path" --prompt "..."
+node "$Z" gui-new    --workspace "/absolute/workspace/path" --prompt "..." --provider "provider-id" --model "model-id" --thought-level "high"
+node "$Z" gui-send   --workspace "/absolute/workspace/path" --session sess_xxx --prompt "..."
+node "$Z" gui-config --workspace "/absolute/workspace/path" --session sess_xxx --provider "provider-id" --model "model-id" --thought-level "high"
 
-# ── SET MODEL / REASONING DIFFICULTY (existing thread) ──
-node "$Z" prepare-gui-config --workspace "/absolute/workspace/path" --session sess_xxx --provider "provider-id" --model "model-id" --thought-level "high"
-node "$Z" execute-gui-config --workspace "/absolute/workspace/path" --session sess_xxx --provider "provider-id" --model "model-id" --thought-level "high" --confirmation ztc_xxx
+# Optional one-off preview: prepare-gui-new/send/config -> execute-gui-new/send/config
 
 # ── ARCHIVE / UNARCHIVE / DELETE ──
 node "$Z" prepare-gui-archive   --workspace "/absolute/workspace/path" --session sess_xxx
@@ -124,7 +126,9 @@ Same flow with `prepare-gui-delete` / `execute-gui-delete`. Calls `deleteTask`, 
 
 ### Create a GUI-visible thread (with optional model / reasoning difficulty)
 
-Use `prepare-gui-new` / `execute-gui-new` when the thread must appear in the desktop task list. `--prompt` is the first message and is required. The thread is created through a V4 `createSession` command with `firstInput`, so the session and its first agent turn are created atomically and the thread is immediately usable.
+Use `gui-new` when the thread must appear in the desktop task list. `--prompt` is the first message and is required. The thread is created through a V4 `createSession` command with `firstInput`, so the session and its first agent turn are created atomically and the thread is immediately usable. Use `prepare-gui-new` / `execute-gui-new` only when the user requests a one-off preview before creation.
+
+The `--workspace` directory (an existing checkout, including an existing Git worktree) must already be open in exactly one ZCode desktop renderer. The skill never opens, creates, or cleans directories for you; use `zthread-gui.mjs probe --workspace <abs>` to verify the workspace is discoverable before dispatching.
 
 - Select a model with `--provider <provider-id> --model <model-id>` together. Model IDs are provider-scoped, so both are required.
 - Select reasoning difficulty with `--thought-level <level>` (ZCode's "thought level"). Valid values are model-specific; common ones are `low`, `medium`, `high`, `xhigh`, `max`, `nothink`.
@@ -134,17 +138,33 @@ Use `prepare-gui-new` / `execute-gui-new` when the thread must appear in the des
 
 ### Set an existing thread's model and reasoning difficulty
 
-Use `prepare-gui-config` / `execute-gui-config` on an existing GUI thread. It calls `zcodeTaskService.setModel` and `setConfigOption` to change the thread's configuration for future turns; it does not start a turn.
+Use `gui-config` on an existing GUI thread. It calls the desktop renderer's session service (`setModel`, `setThoughtLevel`, and `setMode` where requested) to change the thread's configuration for future turns; it does not start a turn.
 
 - Select a model with `--provider <provider-id> --model <model-id>` together. Model IDs are provider-scoped, so both are required.
 - Select reasoning difficulty with `--thought-level <level>`. ZCode calls this a thought level. Valid values are model-specific; read the thread's current options with the GUI or `getTaskConfigOptions` before choosing. Observed values include `low`, `medium`, `high`, `xhigh`, `max`, and `nothink`, but not every model supports all of them.
 - Supply at least one of `--model` (with `--provider`) or `--thought-level`.
 
-Run `prepare-gui-config` first; the provider, model, and thought level are part of the confirmation token, so `execute-gui-config` must repeat the same values. The `changes` field in the result echoes the applied values read back from the thread.
+The result echoes the applied provider, model, and thought level read back from the thread. Use the prepare/execute form only for an explicitly requested one-off preview.
 
 ### Read a thread's messages (fallback)
 
 Prefer the built-in `#sess_xxx` reference + `ReadSessionContext` tool. Use this skill's `read` command only when you need raw text parts without token summarization, or when `ReadSessionContext` is unavailable.
+
+### List available providers and models
+
+`list-models` is read-only and prints the available channels (providers), models, and per-model reasoning levels so the user can choose one before creating or configuring a thread.
+
+```bash
+node "$Z" list-models --workspace "/absolute/workspace/path"
+node "$Z" list-models --workspace "/absolute/workspace/path" --json
+```
+
+Data sources, in order:
+
+1. **Desktop renderer** (workspace open in ZCode): calls the read-only `zcodeSessionService.readWorkspaceState` RPC through the loopback CDP bridge. Includes user-configured and built-in providers, per-model reasoning levels, current selection, and context/modal capabilities.
+2. **Local configuration** (CDP unavailable or workspace not open): parses `~/.zcode/v2/config.json` (user-configured providers only, no built-in catalog) plus `model-provider-display-order.json` for ordering, and marks the output as local-config. Disabled providers are excluded.
+
+The text output ends with usage hints: pass the chosen `--provider <providerId> --model <modelId> [--thought-level <level>]` to `gui-new` (create) or `gui-config` (existing thread). `--json` prints the structured data instead. This command never modifies provider configuration, creates threads, or touches Git worktrees.
 
 ## Fallback
 

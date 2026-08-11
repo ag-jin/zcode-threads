@@ -18,9 +18,13 @@ import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
-const DESKTOP_VERSION = "3.5.3";
-const INFO_PLIST = "/Applications/ZCode.app/Contents/Info.plist";
-const CLI_PATH = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+const DESKTOP_VERSION = "3.6.5";
+const VERIFIED_DESKTOP_VERSIONS = new Set(["3.5.3", "3.6.5"]);
+// Test-only overrides; when unset the real installed desktop is used.
+const INFO_PLIST = process.env.ZCODE_THREADS_INFO_PLIST ?? "/Applications/ZCode.app/Contents/Info.plist";
+const CLI_PATH = process.env.ZCODE_THREADS_CLI_PATH ?? "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+const LOCAL_CONFIG_JSON = process.env.ZCODE_THREADS_CONFIG_JSON ?? `${homedir()}/.zcode/v2/config.json`;
+const LOCAL_DISPLAY_ORDER_JSON = process.env.ZCODE_THREADS_DISPLAY_ORDER_JSON ?? `${homedir()}/.zcode/v2/model-provider-display-order.json`;
 const SESSION_DB = `${homedir()}/.zcode/cli/db/db.sqlite`;
 const TASKS_INDEX_DB = `${homedir()}/.zcode/v2/tasks-index.sqlite`;
 const SKILL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -45,16 +49,20 @@ const HELP = `Usage:
   node zthread.mjs list-deleted --workspace <absolute-path> [--limit <1-100>]
   node zthread.mjs diagnose --workspace <absolute-path> --session <session-id>
   node zthread.mjs read --workspace <absolute-path> --session <session-id> [--turns <1-50>] [--max-chars <1-4000>]
+  node zthread.mjs list-models --workspace <absolute-path> [--json]
   node zthread.mjs prepare-new --workspace <absolute-path> --prompt <text> [--mode <mode>]
   node zthread.mjs prepare-send --workspace <absolute-path> --session <sess-id> --prompt <text> [--mode <mode>]
   node zthread.mjs execute-new --workspace <absolute-path> --prompt <text> [--mode <mode>] --confirmation <ztc-token>
-  node zthread.mjs prepare-gui-new --workspace <absolute-path> --prompt <text> [--provider <id> --model <id>] [--thought-level <level>]
+  node zthread.mjs gui-new --workspace <absolute-path> --prompt <text> [--provider <id> --model <id>] [--thought-level <level>] [--mode <mode>]
+  node zthread.mjs gui-send --workspace <absolute-path> --session <sess-id> --prompt <text>
+  node zthread.mjs gui-config --workspace <absolute-path> --session <sess-id> [--provider <id> --model <id>] [--thought-level <level>]
+  node zthread.mjs prepare-gui-new --workspace <absolute-path> --prompt <text> [--provider <id> --model <id>] [--thought-level <level>] [--mode <mode>]
   node zthread.mjs prepare-gui-send --workspace <absolute-path> --session <sess-id> --prompt <text>
   node zthread.mjs prepare-gui-archive --workspace <absolute-path> --session <sess-id>
   node zthread.mjs prepare-gui-unarchive --workspace <absolute-path> --session <sess-id>
   node zthread.mjs prepare-gui-delete --workspace <absolute-path> --session <sess-id>
   node zthread.mjs prepare-gui-config --workspace <absolute-path> --session <sess-id> [--provider <id> --model <id>] [--thought-level <level>]
-  node zthread.mjs execute-gui-new --workspace <absolute-path> --prompt <text> [--provider <id> --model <id>] [--thought-level <level>] --confirmation <ztc-token>
+  node zthread.mjs execute-gui-new --workspace <absolute-path> --prompt <text> [--provider <id> --model <id>] [--thought-level <level>] [--mode <mode>] --confirmation <ztc-token>
   node zthread.mjs execute-gui-send --workspace <absolute-path> --session <sess-id> --prompt <text> --confirmation <ztc-token>
   node zthread.mjs execute-gui-archive --workspace <absolute-path> --session <sess-id> --confirmation <ztc-token>
   node zthread.mjs execute-gui-unarchive --workspace <absolute-path> --session <sess-id> --confirmation <ztc-token>
@@ -63,7 +71,8 @@ const HELP = `Usage:
   node zthread.mjs guard-install | guard-status | guard-uninstall
 
 list, list-archived, list-deleted, diagnose, and read use a read-only SQLite connection. prepare commands do not create a session or start a turn.
-execute commands can create a session or start a turn and require the exact token shown by the matching prepare command.
+gui-new, gui-send, and gui-config run directly for actions already authorized by the user or a durable automation scope. Their prepare/execute forms remain available when an explicit preview is useful.
+Lifecycle actions (archive, unarchive, and delete) require the exact token shown by the matching prepare command.
 gui commands require a loopback-only ZCode CDP endpoint on port 9333 and run through the active desktop renderer, so successful GUI tasks become immediately visible.`;
 
 class UserError extends Error {}
@@ -76,7 +85,7 @@ function fail(message, details = {}) {
   throw new UserError(message, { cause: details });
 }
 
-function parseOptions(argumentsList, allowed) {
+function parseOptions(argumentsList, allowed, flags = new Set()) {
   const options = {};
 
   for (let index = 0; index < argumentsList.length; index += 1) {
@@ -91,6 +100,11 @@ function parseOptions(argumentsList, allowed) {
     }
     if (Object.hasOwn(options, name)) {
       fail(`Option may only be supplied once: --${name}`);
+    }
+
+    if (flags.has(name)) {
+      options[name] = true;
+      continue;
     }
 
     const value = argumentsList[index + 1];
@@ -174,6 +188,15 @@ function guiSettingFrom(options, name, maximum) {
   return value;
 }
 
+function guiModeFrom(options) {
+  if (options.mode === undefined) return undefined;
+  const mode = modeFrom(options);
+  if (!["build", "edit", "plan", "yolo"].includes(mode)) {
+    fail("--mode must be one of: build, edit, plan, yolo");
+  }
+  return mode;
+}
+
 function guiNewSettingsFrom(options) {
   const provider = guiSettingFrom(options, "provider", 120);
   const model = guiSettingFrom(options, "model", 200);
@@ -181,7 +204,8 @@ function guiNewSettingsFrom(options) {
     fail("--provider and --model must be supplied together for a GUI task");
   }
   const thoughtLevel = guiSettingFrom(options, "thought-level", 80);
-  return { provider, model, thoughtLevel };
+  const mode = guiModeFrom(options);
+  return { provider, model, thoughtLevel, mode };
 }
 
 function sessionIdFrom(options, { resumable = false } = {}) {
@@ -215,7 +239,7 @@ function capabilities() {
     return {
       compatible: false,
       version,
-      expectedVersion: DESKTOP_VERSION,
+      verifiedVersions: [...VERIFIED_DESKTOP_VERSIONS].sort(),
       missingMarkers: REQUIRED_MARKERS,
       reason: `Bundled ZCode runtime not found: ${CLI_PATH}`,
     };
@@ -223,17 +247,18 @@ function capabilities() {
 
   const runtime = readFileSync(CLI_PATH, "utf8");
   const missingMarkers = REQUIRED_MARKERS.filter((marker) => !runtime.includes(marker));
-  const compatible = version === DESKTOP_VERSION && missingMarkers.length === 0;
+  const compatible = VERIFIED_DESKTOP_VERSIONS.has(version) && missingMarkers.length === 0;
   const reason = compatible
     ? null
-    : version !== DESKTOP_VERSION
-      ? `ZCode desktop version ${version} does not match the supported version ${DESKTOP_VERSION}`
+    : !VERIFIED_DESKTOP_VERSIONS.has(version)
+      ? `ZCode desktop version ${version} is not a verified supported version (${[...VERIFIED_DESKTOP_VERSIONS].sort().join(", ")}); re-adapt the GUI bridge before use`
       : `Bundled runtime is missing required markers: ${missingMarkers.join(", ")}`;
 
   return {
     compatible,
     version,
     expectedVersion: DESKTOP_VERSION,
+    verifiedVersions: [...VERIFIED_DESKTOP_VERSIONS].sort(),
     cliPath: CLI_PATH,
     missingMarkers,
     reason,
@@ -304,9 +329,12 @@ function openReadOnlyTaskIndex() {
 function taskIndexTask(workspace, session) {
   const database = openReadOnlyTaskIndex();
   try {
+    const columns = database.prepare("PRAGMA table_info(tasks)").all().map((column) => column.name);
+    const identityColumn = columns.includes("workspace_identity") ? ", workspace_identity" : "";
+    const keyColumn = columns.includes("workspace_key") ? ", workspace_key" : "";
     return database
       .prepare(
-        `SELECT task_id, workspace_path, archived, deleted, title, created_at, updated_at
+        `SELECT task_id, workspace_path, archived, deleted, title, created_at, updated_at${identityColumn}${keyColumn}
          FROM tasks
          WHERE task_id = ? AND workspace_path = ?`,
       )
@@ -367,6 +395,7 @@ function actionDescriptor(request, confirmation) {
   const configSummary = [
     ...(payload.model ? [`model=${payload.provider ? `${payload.provider}/` : ""}${payload.model}`] : []),
     ...(payload.thoughtLevel ? [`thought_level=${payload.thoughtLevel}`] : []),
+    ...(payload.mode ? [`mode=${payload.mode}`] : []),
   ].join(", ");
 
   const sideEffects = configAction
@@ -580,6 +609,8 @@ function taskMetadata(task, session) {
     type: session?.task_type ?? null,
     parentId: session?.parent_id ?? null,
     workspace: task.workspace_path,
+    workspaceKey: task.workspace_key ?? null,
+    workspaceIdentity: task.workspace_identity ?? null,
     createdAt: task.created_at ?? session?.time_created ?? null,
     updatedAt: task.updated_at ?? session?.time_updated ?? null,
     desktopState: state,
@@ -600,7 +631,8 @@ function listTasks(workspace, limit, state) {
         : "deleted = 1";
     taskRows = database
       .prepare(
-        `SELECT task_id, workspace_path, archived, deleted, title, created_at, updated_at
+        `SELECT task_id, workspace_path, archived, deleted, title, created_at, updated_at,
+                workspace_identity, workspace_key
          FROM tasks
          WHERE workspace_path = ? AND ${where}
          ORDER BY updated_at DESC
@@ -660,6 +692,8 @@ function diagnoseSession(workspace, session) {
           id: task.task_id,
           state: taskState,
           title: task.title ?? "",
+          workspaceKey: task.workspace_key ?? null,
+          workspaceIdentity: task.workspace_identity ?? null,
           createdAt: task.created_at ?? null,
           updatedAt: task.updated_at ?? null,
         }
@@ -717,6 +751,147 @@ function readSession(workspace, session, turns, maxChars) {
   }
 }
 
+function reasoningSummary(reasoning) {
+  if (!reasoning) return null;
+  const levels = reasoning.levels ?? reasoning.variants ?? [];
+  if (levels.length === 0) return null;
+  return {
+    levels: levels.map((level) => (typeof level === "string" ? { value: level, label: level } : level)),
+    defaultLevel: reasoning.defaultLevel ?? reasoning.defaultVariant ?? null,
+  };
+}
+
+function rendererModelsText(workspace, settings, modelCatalog) {
+  const lines = [];
+  const providers = modelCatalog?.providers ?? [];
+  for (const provider of providers) {
+    const sourceTag = provider.source === "builtin" ? "内置" : "自定义";
+    lines.push(`渠道 ${provider.label ?? provider.providerId} [${sourceTag}]`);
+    for (const model of provider.models ?? []) {
+      const detail = [];
+      if (model.contextWindow) detail.push(`上下文: ${model.contextWindow}`);
+      const reasoning = reasoningSummary(model.reasoning);
+      if (reasoning) {
+        detail.push(`思考等级: ${reasoning.levels.map((level) => level.value).join("/")}${reasoning.defaultLevel ? `, 默认 ${reasoning.defaultLevel}` : ""}`);
+      }
+      lines.push(`  - ${model.label ?? model.modelId}${detail.length ? ` (${detail.join(", ")})` : ""}`);
+    }
+  }
+  const current = settings?.model?.current;
+  if (current) {
+    lines.push("");
+    lines.push(`当前选择: ${current.providerId}/${current.modelId}${settings?.thoughtLevel?.current ? ` (思考等级: ${settings.thoughtLevel.current})` : ""}`);
+  }
+  lines.push("");
+  lines.push("选择后创建 GUI 线程: gui-new --workspace <abs> --prompt \"...\" --provider <providerId> --model <modelId> [--thought-level <level>]");
+  lines.push("配置现有线程: gui-config --workspace <abs> --session sess_xxx --provider <providerId> --model <modelId> [--thought-level <level>]");
+  return lines.join("\n");
+}
+
+function localModelsText(workspace, providers) {
+  const lines = [
+    `可用渠道与模型（来源: 本地配置 ${LOCAL_CONFIG_JSON}，仅用户自定义渠道，不含内置模型）`,
+    "",
+  ];
+  if (providers.length === 0) {
+    lines.push("没有已启用的用户自定义渠道。");
+  }
+  for (const provider of providers) {
+    const kindTag = provider.kind ? ` [${provider.kind}]` : "";
+    lines.push(`渠道 ${provider.label}${kindTag}`);
+    for (const model of provider.models) {
+      const detail = [];
+      const reasoning = reasoningSummary(model.reasoning);
+      if (reasoning) {
+        detail.push(`思考等级: ${reasoning.levels.map((level) => level.value).join("/")}${reasoning.defaultLevel ? `, 默认 ${reasoning.defaultLevel}` : ""}`);
+      }
+      lines.push(`  - ${model.label}${detail.length ? ` (${detail.join(", ")})` : ""}`);
+    }
+  }
+  lines.push("");
+  lines.push("选择后创建 GUI 线程: gui-new --workspace <abs> --prompt \"...\" --provider <providerId> --model <modelId> [--thought-level <level>]");
+  lines.push("配置现有线程: gui-config --workspace <abs> --session sess_xxx --provider <providerId> --model <modelId> [--thought-level <level>]");
+  return lines.join("\n");
+}
+
+function readLocalModels() {
+  const providers = [];
+  if (!existsSync(LOCAL_CONFIG_JSON)) {
+    return { providers, warning: `本地渠道配置不存在: ${LOCAL_CONFIG_JSON}` };
+  }
+  let config;
+  try {
+    config = JSON.parse(readFileSync(LOCAL_CONFIG_JSON, "utf8"));
+  } catch {
+    fail(`本地渠道配置无法解析: ${LOCAL_CONFIG_JSON}`);
+  }
+  const providersMap = config?.provider ?? {};
+  let order = [];
+  if (existsSync(LOCAL_DISPLAY_ORDER_JSON)) {
+    try {
+      order = JSON.parse(readFileSync(LOCAL_DISPLAY_ORDER_JSON, "utf8"))?.providerIds ?? [];
+    } catch {
+      // Ordering is a hint only; ignore malformed display order files.
+    }
+  }
+  const ids = [...new Set([...order, ...Object.keys(providersMap)])];
+  for (const id of ids) {
+    const provider = providersMap[id];
+    if (!provider || provider.enabled === false) continue;
+    const models = Object.entries(provider.models ?? {}).map(([modelId, model]) => ({
+      modelId,
+      label: typeof model?.name === "string" && model.name ? model.name : modelId,
+      reasoning: reasoningSummary(model?.reasoning),
+    }));
+    providers.push({
+      providerId: id,
+      label: typeof provider.name === "string" && provider.name ? provider.name : id,
+      kind: provider.kind ?? null,
+      source: provider.source ?? "custom",
+      models,
+    });
+  }
+  return { providers };
+}
+
+function listModels(workspace) {
+  const bridge = spawnSync(
+    process.execPath,
+    [GUI_BRIDGE_PATH, "models", "--workspace", workspace],
+    { encoding: "utf8", timeout: 15000 },
+  );
+  if (bridge.status === 0 && bridge.stdout) {
+    try {
+      const parsed = JSON.parse(bridge.stdout);
+      if (parsed.settings && parsed.modelCatalog) {
+        const data = {
+          source: "desktop-renderer",
+          workspace,
+          settings: parsed.settings,
+          modelCatalog: parsed.modelCatalog,
+        };
+        return {
+          data,
+          text: `可用渠道与模型（来源: 桌面渲染器，工作区: ${workspace}）\n\n${rendererModelsText(workspace, parsed.settings, parsed.modelCatalog)}`,
+        };
+      }
+    } catch {
+      // Fall through to the local configuration path.
+    }
+  }
+  const local = readLocalModels();
+  const data = {
+    source: "local-config",
+    workspace,
+    ...(local.warning ? { warning: local.warning } : {}),
+    providers: local.providers,
+  };
+  return {
+    data,
+    text: localModelsText(workspace, local.providers),
+  };
+}
+
 function runGuiAction(descriptor) {
   if (!existsSync(GUI_BRIDGE_PATH)) {
     fail(`ZCode GUI bridge not found: ${GUI_BRIDGE_PATH}`);
@@ -751,11 +926,14 @@ function runGuiAction(descriptor) {
       if (descriptor.provider !== undefined) args.push("--provider", descriptor.provider);
       if (descriptor.model !== undefined) args.push("--model", descriptor.model);
       if (descriptor.thoughtLevel !== undefined) args.push("--thought-level", descriptor.thoughtLevel);
+      if (descriptor.mode !== undefined) args.push("--mode", descriptor.mode);
     }
   }
 
   printJson({
-    status: "starting-confirmed-gui-action",
+    status: descriptor.confirmation
+      ? "starting-confirmed-gui-action"
+      : "starting-authorized-gui-action",
     action: descriptor.action,
     workspace: descriptor.workspace,
     ...(descriptor.session ? { session: descriptor.session } : {}),
@@ -931,18 +1109,26 @@ function commandOptions(command, argumentsList) {
       return parseOptions(argumentsList, new Set(["workspace", "session"]));
     case "read":
       return parseOptions(argumentsList, new Set(["workspace", "session", "turns", "max-chars"]));
+    case "list-models":
+      return parseOptions(argumentsList, new Set(["workspace", "json"]), new Set(["json"]));
     case "prepare-new":
     case "execute-new":
       return parseOptions(argumentsList, new Set(["workspace", "prompt", "mode", "confirmation"]));
     case "prepare-send":
     case "execute-send":
       return parseOptions(argumentsList, new Set(["workspace", "session", "prompt", "mode", "confirmation"]));
+    case "gui-new":
+      return parseOptions(argumentsList, new Set(["workspace", "prompt", "provider", "model", "thought-level", "mode"]));
     case "prepare-gui-new":
     case "execute-gui-new":
-      return parseOptions(argumentsList, new Set(["workspace", "prompt", "provider", "model", "thought-level", "confirmation"]));
+      return parseOptions(argumentsList, new Set(["workspace", "prompt", "provider", "model", "thought-level", "mode", "confirmation"]));
+    case "gui-config":
+      return parseOptions(argumentsList, new Set(["workspace", "session", "provider", "model", "thought-level"]));
     case "prepare-gui-config":
     case "execute-gui-config":
       return parseOptions(argumentsList, new Set(["workspace", "session", "provider", "model", "thought-level", "confirmation"]));
+    case "gui-send":
+      return parseOptions(argumentsList, new Set(["workspace", "session", "prompt"]));
     case "prepare-gui-send":
     case "execute-gui-send":
       return parseOptions(argumentsList, new Set(["workspace", "session", "prompt", "confirmation"]));
@@ -1022,6 +1208,18 @@ function execute(command, options) {
     return;
   }
 
+  if (command === "list-models") {
+    requireCompatible(command);
+    const workspace = workspaceFrom(options);
+    const result = listModels(workspace);
+    if (options.json) {
+      printJson(result.data);
+      return;
+    }
+    process.stdout.write(`${result.text}\n`);
+    return;
+  }
+
   if (command === "guard-install") {
     guardInstall();
     return;
@@ -1039,7 +1237,9 @@ function execute(command, options) {
   const archiveCommand = command === "prepare-gui-archive" || command === "execute-gui-archive"
     || command === "prepare-gui-unarchive" || command === "execute-gui-unarchive"
     || command === "prepare-gui-delete" || command === "execute-gui-delete";
-  const configCommand = command === "prepare-gui-config" || command === "execute-gui-config";
+  const configCommand = command === "gui-config"
+    || command === "prepare-gui-config"
+    || command === "execute-gui-config";
   let action;
   if (archiveCommand) {
     action = command.includes("unarchive") ? "gui-unarchive"
@@ -1054,7 +1254,7 @@ function execute(command, options) {
   }
   const workspace = workspaceFrom(options);
   const prompt = (archiveCommand || configCommand) ? undefined : promptFrom(options);
-  const mode = (guiAction || archiveCommand || configCommand) ? undefined : modeFrom(options);
+  const mode = (archiveCommand || configCommand || action === "gui-send") ? undefined : modeFrom(options);
   const session = (action.endsWith("send") || archiveCommand || configCommand) ? sessionIdFrom(options, { resumable: true }) : undefined;
   const guiConfigSettings = (configCommand || action === "gui-new") ? guiNewSettingsFrom(options) : {};
   if (configCommand && guiConfigSettings.model === undefined && guiConfigSettings.thoughtLevel === undefined) {
@@ -1112,9 +1312,17 @@ function execute(command, options) {
     return;
   }
 
-  const confirmation = required(options, "confirmation");
-  claimPendingAction(confirmation, request);
-  const descriptor = actionDescriptor(request, confirmation);
+  const directGuiCommand = command === "gui-new"
+    || command === "gui-send"
+    || command === "gui-config";
+  let descriptor;
+  if (directGuiCommand) {
+    descriptor = actionDescriptor(request, undefined);
+  } else {
+    const confirmation = required(options, "confirmation");
+    claimPendingAction(confirmation, request);
+    descriptor = actionDescriptor(request, confirmation);
+  }
   if (action.startsWith("gui-")) {
     runGuiAction(descriptor);
     return;

@@ -31,6 +31,7 @@ trap cleanup EXIT
 
 zcode_pids() {
   {
+    pgrep -x ZCode || true
     pgrep -f '/Applications/ZCode.app/Contents/MacOS/ZCode' || true
   } | sort -u
 }
@@ -84,20 +85,7 @@ restart_zcode_with_cdp() {
 # --- 主逻辑 ---
 
 if ! zcode_running; then
-  # ZCode 没运行，自动启动带 CDP 端口
-  # 防止频繁启动: 距上次启动不足 120 秒则跳过
-  if [[ -f "$RESTART_FLAG" ]]; then
-    last_mod=$(stat -f %m "$RESTART_FLAG" 2>/dev/null || echo 0)
-    now=$(date +%s)
-    diff=$((now - last_mod))
-    if [[ $diff -lt 120 ]]; then
-      log "Skipping launch: last start was ${diff}s ago (< 120s cooldown)"
-      exit 0
-    fi
-  fi
-  log "ZCode not running; launching with --remote-debugging-port=$PORT"
-  open -a "$ZCODE_APP_PATH" --args --remote-debugging-port="$PORT"
-  touch "$RESTART_FLAG"
+  # ZCode 没运行，不自动启动
   exit 0
 fi
 

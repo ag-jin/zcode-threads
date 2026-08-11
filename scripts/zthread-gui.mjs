@@ -6,7 +6,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 
-const DESKTOP_VERSION = "3.5.3";
+const DESKTOP_VERSION = "3.6.5";
+const VERIFIED_DESKTOP_VERSIONS = new Set(["3.5.3", "3.6.5"]);
 const INFO_PLIST = "/Applications/ZCode.app/Contents/Info.plist";
 const TASKS_INDEX_DB = `${homedir()}/.zcode/v2/tasks-index.sqlite`;
 const SESSION_DB = `${homedir()}/.zcode/cli/db/db.sqlite`;
@@ -22,18 +23,18 @@ function fail(message) {
 
 function parseArguments(argumentsList) {
   const [action, ...optionsList] = argumentsList;
-  const validActions = ["new", "send", "probe", "archive", "unarchive", "delete", "config"];
+  const validActions = ["new", "send", "probe", "models", "archive", "unarchive", "delete", "config"];
   if (!validActions.includes(action)) {
     fail(`Expected action: ${validActions.join(", ")}`);
   }
 
   const options = {};
-  const allowed = action === "probe"
+  const allowed = action === "probe" || action === "models"
     ? new Set(["workspace"])
     : action === "config"
       ? new Set(["workspace", "session", "provider", "model", "thought-level"])
       : action === "new"
-        ? new Set(["workspace", "prompt", "provider", "model", "thought-level"])
+        ? new Set(["workspace", "prompt", "provider", "model", "thought-level", "mode"])
         : new Set(["workspace", "prompt", "session"]);
   for (let index = 0; index < optionsList.length; index += 1) {
     const argument = optionsList[index];
@@ -63,6 +64,9 @@ function parseArguments(argumentsList) {
     fail("Missing required option: --session");
   }
   const { ["thought-level"]: thoughtLevel, ...rest } = options;
+  if (rest.mode !== undefined && !["build", "edit", "plan", "yolo"].includes(rest.mode)) {
+    fail("--mode must be one of: build, edit, plan, yolo");
+  }
   return { action, ...rest, thoughtLevel };
 }
 
@@ -82,8 +86,8 @@ function desktopVersion() {
 
 function assertCompatibleDesktop() {
   const version = desktopVersion();
-  if (version !== DESKTOP_VERSION) {
-    fail(`ZCode ${version} is unsupported; this bridge requires ${DESKTOP_VERSION}`);
+  if (!VERIFIED_DESKTOP_VERSIONS.has(version)) {
+    fail(`ZCode ${version} is unsupported; this bridge requires a verified desktop version (${[...VERIFIED_DESKTOP_VERSIONS].sort().join(", ")})`);
   }
 }
 
@@ -470,8 +474,8 @@ function invocationExpression({ action, workspace, prompt, session }) {
   `;
 }
 
-function createSessionExpression({ workspace, prompt, provider, model, thoughtLevel }) {
-  const request = JSON.stringify({ workspace, prompt, provider, model, thoughtLevel });
+function createSessionExpression({ workspace, prompt, provider, model, thoughtLevel, mode }) {
+  const request = JSON.stringify({ workspace, prompt, provider, model, thoughtLevel, mode });
   return `
     (async function () {
       const request = ${request};
@@ -568,10 +572,46 @@ function createSessionExpression({ workspace, prompt, provider, model, thoughtLe
       if (modelId && modelId.indexOf("/") > 0) modelId = modelId.slice(modelId.indexOf("/") + 1);
       const workspaceId = (match.workspaceIdentity && match.workspaceIdentity.trim()) || request.workspace;
 
+      const resolveRef = async (providerName, modelName) => {
+        if (!providerName || !modelName) return { ref: null, state: null };
+        const reader = typeof agent.readWorkspaceState === "function" ? agent : null;
+        let state = null;
+        if (reader) {
+          try {
+            state = await reader.readWorkspaceState({ workspacePath: request.workspace });
+          } catch {
+            return { error: "无法读取工作区模型状态以解析模型引用" };
+          }
+        }
+        const available = state?.settings?.model?.available ?? [];
+        const exact = available.filter((item) => item.ref.providerId === providerName && (item.ref.modelId === modelName || item.label === modelName));
+        if (exact.length === 1) return { ref: exact[0].ref, state };
+        const byLabel = available.filter((item) => item.providerLabel === providerName && (item.label === modelName || item.ref.modelId === modelName));
+        if (byLabel.length === 1) return { ref: byLabel[0].ref, state };
+        if (byLabel.length > 1) {
+          return { error: "渠道 " + providerName + " 下存在多个匹配 " + modelName + " 的模型: " + byLabel.map((item) => item.ref.providerId + "/" + item.ref.modelId + " (" + item.label + ")").join(", ") + "；请使用 providerId 精确指定" };
+        }
+        return { error: "在工作区可用模型中找不到渠道 " + providerName + " 的模型 " + modelName + "；请先运行 list-models 确认" };
+      };
+      const resolved = await resolveRef(provider, modelId);
+      if (resolved.error) return { error: resolved.error };
+      const ref = resolved.ref;
+      if (request.thoughtLevel && ref) {
+        const catalog = resolved.state?.modelCatalog?.providers ?? [];
+        const catalogModel = catalog.find((item) => item.providerId === ref.providerId)?.models?.find((item) => item.modelId === ref.modelId);
+        const levels = catalogModel?.reasoning?.levels ?? [];
+        if (levels.length === 0) {
+          return { error: "模型 " + ref.providerId + "/" + ref.modelId + " 不支持思考等级（无法设置 " + request.thoughtLevel + "）" };
+        }
+        if (!levels.some((item) => item.value === request.thoughtLevel)) {
+          return { error: "模型 " + ref.providerId + "/" + ref.modelId + " 支持思考等级 " + levels.map((item) => item.value).join("/") + "，不支持 " + request.thoughtLevel };
+        }
+      }
+
       const config = {
-        ...(provider ? { provider } : {}),
-        ...(modelId ? { model: modelId } : {}),
+        ...(ref ? { provider: ref.providerId, model: ref.modelId } : {}),
         ...(request.thoughtLevel ? { thought: request.thoughtLevel } : {}),
+        ...(request.mode ? { mode: request.mode } : {}),
       };
       const envelope = {
         commandId: crypto.randomUUID(),
@@ -810,8 +850,8 @@ function archiveTaskExpression({ workspace, session, action, workspaceIdentity }
   `;
 }
 
-function configTaskExpression({ workspace, session, provider, model, thoughtLevel }) {
-  const request = JSON.stringify({ workspace, session, provider, model, thoughtLevel });
+function configTaskExpression({ workspace, session, provider, model, thoughtLevel, mode, workspaceIdentity }) {
+  const request = JSON.stringify({ workspace, session, provider, model, thoughtLevel, mode, workspaceIdentity });
   return `
     (async function () {
       const request = ${request};
@@ -860,7 +900,7 @@ function configTaskExpression({ workspace, session, provider, model, thoughtLeve
         seen.add(fiber);
         const props = fiber.memoizedProps;
         const scoped = props && props.workspaceScopedServices;
-        const candidate = scoped && scoped.zcodeTaskService;
+        const candidate = scoped && scoped.zcodeSessionService;
         if (candidate) {
           const scope = [];
           let ancestor = fiber;
@@ -886,49 +926,168 @@ function configTaskExpression({ workspace, session, provider, model, thoughtLeve
         if (fiber.child) queue.push(fiber.child);
         if (fiber.sibling) queue.push(fiber.sibling);
       }
-      if (matchingServices.size > 1) return { error: "multiple-matching-task-services" };
-      const taskService = [...matchingServices.keys()][0];
-      if (!taskService) return { error: "no-unique-workspace-task-service" };
+      if (matchingServices.size > 1) return { error: "multiple-matching-session-services" };
+      const sessionService = [...matchingServices.keys()][0];
+      if (!sessionService) return { error: "no-unique-workspace-session-service" };
 
       const changes = {};
+      const base = {
+        workspacePath: request.workspace,
+        ...(request.workspaceIdentity !== undefined ? { workspaceIdentity: request.workspaceIdentity } : {}),
+        sessionId: request.session,
+      };
       try {
+        let resolvedState = null;
         if (request.model) {
-          if (typeof taskService.setModel !== "function") return { error: "task-service-missing-setModel" };
-          const modelRef = request.provider
-            ? { providerId: request.provider, modelId: request.model }
-            : (() => {
-                const sep = request.model.indexOf("/");
-                return sep > 0
-                  ? { providerId: request.model.slice(0, sep), modelId: request.model.slice(sep + 1) }
-                  : { providerId: "glm", modelId: request.model };
-              })();
-          const opts = await taskService.setModel({
-            taskId: request.session,
-            workspacePath: request.workspace,
-            modelRef,
-          });
-          const modelOpt = opts?.find((o) => o.id === "model");
-          changes.model = modelOpt?.currentValue ?? null;
+          if (typeof sessionService.setModel !== "function") return { error: "session-service-missing-setModel" };
+          let state = null;
+          if (typeof sessionService.readWorkspaceState === "function") {
+            try {
+              state = await sessionService.readWorkspaceState({ workspacePath: request.workspace });
+            } catch {
+              return { error: "无法读取工作区模型状态以解析模型引用" };
+            }
+          }
+          const available = state?.settings?.model?.available ?? [];
+          const exact = available.filter((item) => item.ref.providerId === request.provider && (item.ref.modelId === request.model || item.label === request.model));
+          let ref = exact.length === 1 ? exact[0].ref : null;
+          if (!ref && request.provider) {
+            const byLabel = available.filter((item) => item.providerLabel === request.provider && (item.label === request.model || item.ref.modelId === request.model));
+            if (byLabel.length === 1) {
+              ref = byLabel[0].ref;
+            } else if (byLabel.length > 1) {
+              return { error: "渠道 " + request.provider + " 下存在多个匹配 " + request.model + " 的模型: " + byLabel.map((item) => item.ref.providerId + "/" + item.ref.modelId + " (" + item.label + ")").join(", ") + "；请使用 providerId 精确指定" };
+            }
+          }
+          if (!ref) {
+            return { error: "在工作区可用模型中找不到渠道 " + (request.provider ?? "?") + " 的模型 " + request.model + "；请先运行 list-models 确认" };
+          }
+          resolvedState = state;
+          const settings = await sessionService.setModel({ ...base, model: ref });
+          changes.model = settings?.settings?.model?.current ?? null;
         }
         if (request.thoughtLevel) {
-          if (typeof taskService.setConfigOption !== "function") return { error: "task-service-missing-setConfigOption" };
-          await taskService.setConfigOption({
-            taskId: request.session,
-            workspacePath: request.workspace,
-            configId: "thought_level",
-            value: request.thoughtLevel,
-            traceId: crypto.randomUUID(),
-          });
-          const opts = await taskService.getTaskConfigOptions({
-            taskId: request.session,
-            workspacePath: request.workspace,
-          });
-          const tlOpt = opts?.find((o) => o.id === "thought_level");
-          changes.thoughtLevel = tlOpt?.currentValue ?? null;
+          if (typeof sessionService.setThoughtLevel !== "function") return { error: "session-service-missing-setThoughtLevel" };
+          // When a model is supplied alongside the thought level, validate
+          // against that model's supported reasoning levels up front. A
+          // thought-level-only change is left to the session service to
+          // validate against the thread's current model.
+          if (request.model) {
+            const catalog = resolvedState?.modelCatalog?.providers ?? [];
+            const catalogModel = catalog
+              .find((item) => !request.provider || item.providerId === request.provider || item.label === request.provider)
+              ?.models?.find((item) => item.modelId === request.model || item.label === request.model);
+            const levels = catalogModel?.reasoning?.levels ?? [];
+            if (levels.length === 0) {
+              return { error: "模型 " + (request.provider ?? "?") + "/" + request.model + " 不支持思考等级（无法设置 " + request.thoughtLevel + "）" };
+            }
+            if (!levels.some((item) => item.value === request.thoughtLevel)) {
+              return { error: "模型 " + (request.provider ?? "?") + "/" + request.model + " 支持思考等级 " + levels.map((item) => item.value).join("/") + "，不支持 " + request.thoughtLevel };
+            }
+          }
+          const settings = await sessionService.setThoughtLevel({ ...base, thoughtLevel: request.thoughtLevel });
+          changes.thoughtLevel = settings?.settings?.thoughtLevel?.current ?? null;
+        }
+        if (request.mode) {
+          if (typeof sessionService.setMode !== "function") return { error: "session-service-missing-setMode" };
+          const settings = await sessionService.setMode({ ...base, mode: request.mode });
+          changes.mode = settings?.settings?.mode?.current ?? null;
         }
         return { taskId: request.session, changes };
       } catch (error) {
         return { error: String(error && error.message || error), changes };
+      }
+    })()
+  `;
+}
+
+function readWorkspaceStateExpression({ workspace }) {
+  const request = JSON.stringify({ workspace });
+  return `
+    (async function () {
+      const request = ${request};
+      const root = document.getElementById("root");
+      const fiberKey = root && Object.keys(root).find((key) => key.startsWith("__reactContainer$"));
+      if (!fiberKey) return { error: "no-react-root" };
+
+      const directWorkspaceValues = (source) => [
+        source?.workspacePath,
+        source?.workspaceKey,
+        source?.workspace?.path,
+        source?.workspace?.directory,
+        source?.workspaceState?.path,
+      ].filter((value) => typeof value === "string");
+      const absolutePaths = (source) => {
+        const values = new Set();
+        const seenObjects = new Set();
+        const objectQueue = [{ value: source, depth: 0 }];
+        while (objectQueue.length && seenObjects.size < 3000) {
+          const { value, depth } = objectQueue.shift();
+          if (!value || (typeof value !== "object" && typeof value !== "function") || seenObjects.has(value)) continue;
+          seenObjects.add(value);
+          let descriptors;
+          try {
+            descriptors = Object.getOwnPropertyDescriptors(value);
+          } catch {
+            continue;
+          }
+          for (const descriptor of Object.values(descriptors)) {
+            if (!("value" in descriptor)) continue;
+            const child = descriptor.value;
+            if (typeof child === "string" && child.startsWith("/")) values.add(child);
+            if (depth < 4 && child && (typeof child === "object" || typeof child === "function")) {
+              objectQueue.push({ value: child, depth: depth + 1 });
+            }
+          }
+        }
+        return [...values];
+      };
+      const seen = new Set();
+      const queue = [root[fiberKey]];
+      const matchingServices = new Map();
+      while (queue.length && seen.size < 120000) {
+        const fiber = queue.shift();
+        if (!fiber || seen.has(fiber)) continue;
+        seen.add(fiber);
+        const props = fiber.memoizedProps;
+        const scoped = props && props.workspaceScopedServices;
+        const candidate = scoped && scoped.zcodeSessionService;
+        if (candidate) {
+          const scope = [];
+          let ancestor = fiber;
+          for (let depth = 0; ancestor && depth < 12; depth += 1, ancestor = ancestor.return) {
+            scope.push(ancestor.memoizedProps, ancestor.memoizedState);
+          }
+          const workspaces = new Set([
+            ...directWorkspaceValues(props),
+            ...directWorkspaceValues(scoped),
+            ...directWorkspaceValues(candidate),
+            ...scope.flatMap((value) => directWorkspaceValues(value)),
+            ...absolutePaths([props, scoped, candidate, ...scope]),
+          ]);
+          if (workspaces.has(request.workspace)) {
+            const identity = typeof props?.workspaceIdentity === "string"
+              ? props.workspaceIdentity
+              : typeof scoped?.workspaceIdentity === "string"
+                ? scoped.workspaceIdentity
+                : null;
+            matchingServices.set(candidate, identity);
+          }
+        }
+        if (fiber.child) queue.push(fiber.child);
+        if (fiber.sibling) queue.push(fiber.sibling);
+      }
+      if (matchingServices.size > 1) return { error: "multiple-matching-session-services" };
+      const sessionService = [...matchingServices.keys()][0];
+      if (!sessionService) return { error: "no-unique-workspace-session-service" };
+      if (typeof sessionService.readWorkspaceState !== "function") return { error: "session-service-missing-readWorkspaceState" };
+      try {
+        const state = await sessionService.readWorkspaceState({
+          workspacePath: request.workspace,
+        });
+        return { state };
+      } catch (error) {
+        return { error: String(error && error.message || error) };
       }
     })()
   `;
@@ -949,8 +1108,7 @@ async function probeWorkspaceRenderers(workspace) {
         draftOptions: candidate.draftOptions,
         canCreateTask: candidate.canCreateTask,
         canSendPrompt: candidate.canSendPrompt,
-      }));
-      const matchingServices = services.filter((candidate) =>
+      }));      const matchingServices = services.filter((candidate) =>
         candidate.canCreateTask && candidate.canSendPrompt && candidate.workspaceCandidates.includes(workspace),
       );
       reports.push({
@@ -1010,8 +1168,11 @@ function taskIndexEntry(taskId, workspace) {
   }
   const database = new DatabaseSync(TASKS_INDEX_DB, { readOnly: true });
   try {
+    const columns = database.prepare("PRAGMA table_info(tasks)").all().map((column) => column.name);
+    const identityColumn = columns.includes("workspace_identity") ? ", workspace_identity" : "";
+    const keyColumn = columns.includes("workspace_key") ? ", workspace_key" : "";
     return database.prepare(
-      `SELECT task_id, workspace_path, archived, deleted
+      `SELECT task_id, workspace_path, archived, deleted${identityColumn}${keyColumn}
        FROM tasks
        WHERE task_id = ? AND workspace_path = ?`,
     ).get(taskId, workspace);
@@ -1055,16 +1216,36 @@ async function assertCreatedTask(taskId, workspace) {
   );
 }
 
-async function assertPersistedRootTask(taskId, workspace) {
+function persistedSessionMode(taskId, workspace) {
+  if (!existsSync(SESSION_DB)) {
+    fail(`ZCode session store not found: ${SESSION_DB}`);
+  }
+  const database = new DatabaseSync(SESSION_DB, { readOnly: true });
+  try {
+    const row = database.prepare(
+      `SELECT json_extract(permission, '$.mode') AS mode
+       FROM session
+       WHERE id = ? AND directory = ?`,
+    ).get(taskId, workspace);
+    return row?.mode ?? null;
+  } finally {
+    database.close();
+  }
+}
+
+async function assertPersistedRootTask(taskId, workspace, expectedMode) {
   const deadline = Date.now() + INDEX_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const task = activeVisibleTask(taskId, workspace);
     const session = rootInteractiveSessionEntry(taskId, workspace);
-    if (task && session) return;
+    const mode = expectedMode === undefined ? null : persistedSessionMode(taskId, workspace);
+    if (task && session && (expectedMode === undefined || mode === expectedMode)) {
+      return { mode };
+    }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   fail(
-    `ZCode did not persist ${taskId} as an active GUI task and root interactive session in ${workspace} within ${INDEX_TIMEOUT_MS}ms after accepting the prompt`,
+    `ZCode did not persist ${taskId} as an active GUI task and root interactive session${expectedMode ? ` with mode ${expectedMode}` : ""} in ${workspace} within ${INDEX_TIMEOUT_MS}ms after accepting the prompt`,
   );
 }
 
@@ -1074,8 +1255,11 @@ function taskIndexArchivedState(taskId, workspace) {
   }
   const database = new DatabaseSync(TASKS_INDEX_DB, { readOnly: true });
   try {
+    const columns = database.prepare("PRAGMA table_info(tasks)").all().map((column) => column.name);
+    const identityColumn = columns.includes("workspace_identity") ? ", workspace_identity" : "";
+    const keyColumn = columns.includes("workspace_key") ? ", workspace_key" : "";
     return database.prepare(
-      `SELECT task_id, workspace_path, archived, deleted
+      `SELECT task_id, workspace_path, archived, deleted${identityColumn}${keyColumn}
        FROM tasks
        WHERE task_id = ? AND workspace_path = ?`,
     ).get(taskId, workspace);
@@ -1109,27 +1293,50 @@ async function assertDeletedState(taskId, workspace) {
 }
 
 async function main() {
-  const request = parseArguments(process.argv.slice(2));
-  assertCompatibleDesktop();
-  const listener = assertLoopbackZCodeListener();
-  if (request.action === "probe") {
-    const renderers = await probeWorkspaceRenderers(request.workspace);
-    const matchingRendererCount = renderers.filter((renderer) => renderer.matchingServiceCount > 0).length;
-    process.stdout.write(`${JSON.stringify({
-      status: matchingRendererCount === 1 ? "gui-bridge-ready" : "gui-bridge-not-ready",
-      action: request.action,
-      workspace: request.workspace,
-      cdpPort: PORT,
-      listenerPid: listener.pid,
-      matchingRendererCount,
-      renderers,
-    }, null, 2)}\n`);
-    process.exitCode = matchingRendererCount === 1 ? 0 : 1;
-    return;
-  }
+    const request = parseArguments(process.argv.slice(2));
+    assertCompatibleDesktop();
+    const listener = assertLoopbackZCodeListener();
+    if (request.action === "probe") {
+      const renderers = await probeWorkspaceRenderers(request.workspace);
+      const matchingRendererCount = renderers.filter((renderer) => renderer.matchingServiceCount > 0).length;
+      const exactMatch = renderers.flatMap((renderer) => renderer.services ?? []).find((service) =>
+        service.workspaceCandidates?.includes(request.workspace),
+      );
+      process.stdout.write(`${JSON.stringify({
+        status: matchingRendererCount === 1 ? "gui-bridge-ready" : "gui-bridge-not-ready",
+        action: request.action,
+        workspace: request.workspace,
+        cdpPort: PORT,
+        listenerPid: listener.pid,
+        matchingRendererCount,
+        workspaceIdentity: exactMatch?.workspaceIdentity ?? null,
+        renderers,
+      }, null, 2)}\n`);
+      process.exitCode = matchingRendererCount === 1 ? 0 : 1;
+      return;
+    }
 
   const connection = await selectWorkspaceRenderer(request.workspace);
   try {
+    if (request.action === "models") {
+      const result = await connection.evaluate(readWorkspaceStateExpression({
+        workspace: request.workspace,
+      }));
+      if (!result?.state) {
+        fail(result?.error ?? "ZCode session service returned no workspace state");
+      }
+      process.stdout.write(`${JSON.stringify({
+        status: "workspace-models",
+        action: request.action,
+        workspace: request.workspace,
+        settings: result.state.settings ?? null,
+        modelCatalog: result.state.modelCatalog ?? null,
+        cdpPort: PORT,
+        listenerPid: listener.pid,
+      }, null, 2)}\n`);
+      return;
+    }
+
     if (request.action === "archive" || request.action === "unarchive" || request.action === "delete") {
       const result = await connection.evaluate(archiveTaskExpression({
         workspace: request.workspace,
@@ -1170,6 +1377,8 @@ async function main() {
         provider: request.provider,
         model: request.model,
         thoughtLevel: request.thoughtLevel,
+        mode: request.mode,
+        workspaceIdentity: request.workspaceIdentity,
       }));
       if (!result?.taskId) {
         fail(result?.error ?? `ZCode GUI task service did not configure ${request.session}`);
@@ -1193,16 +1402,21 @@ async function main() {
         provider: request.provider,
         model: request.model,
         thoughtLevel: request.thoughtLevel,
+        mode: request.mode,
       }));
       if (!result?.taskId) {
         fail(result?.error ?? "ZCode agent service returned no session ID");
       }
-      await assertPersistedRootTask(result.taskId, request.workspace);
+      const persisted = await assertPersistedRootTask(result.taskId, request.workspace, request.mode);
       process.stdout.write(`${JSON.stringify({
         status: "gui-task-visible",
         action: request.action,
         sessionId: result.taskId,
         workspace: request.workspace,
+        ...(request.provider ? { provider: request.provider } : {}),
+        ...(request.model ? { model: request.model } : {}),
+        ...(request.thoughtLevel ? { thoughtLevel: request.thoughtLevel } : {}),
+        ...(request.mode ? { mode: persisted.mode } : {}),
         cdpPort: PORT,
         listenerPid: listener.pid,
       }, null, 2)}\n`);
